@@ -26,6 +26,7 @@ from collections import namedtuple
 
 import numpy as np
 import cv2
+from numpy import vstack, hstack
 
 # import matplotlib.pyplot as plt
 # from mpl_toolkits.mplot3d import Axes3D
@@ -40,7 +41,7 @@ from common import getsize, draw_keypoints
 import sys,os
 thisdir=os.path.dirname(os.path.abspath(__file__))
 
-np.set_printoptions(suppress=False, formatter={'float_kind':lambda x: "%.2f" % x})
+np.set_printoptions(suppress=False, formatter={'float_kind':lambda x: "%.5f" % x})
 
 FLANN_INDEX_KDTREE = 1
 FLANN_INDEX_LSH    = 6
@@ -67,7 +68,7 @@ PlanarTarget = namedtuple('PlaneTarget', 'image, rect, keypoints, descrs, data')
   H      - homography matrix from p0 to p1
   quad   - target bounary quad in input frame
 '''
-TrackedTarget = namedtuple('TrackedTarget', 'target, p0, p1, H, F, e1, e2, H1, H2, quad')
+TrackedTarget = namedtuple('TrackedTarget', 'target, p0, p1, H, K, F, e1, e2, H1, H2, quad')
 
 class PlaneTracker:
     def __init__(self):
@@ -123,7 +124,9 @@ class PlaneTracker:
             #     continue
             # p0, p1 = p0[status], p1[status]
 
-            F, status = cv2.findFundamentalMat(p0, p1, cv2.FM_8POINT, 3, .99, status)
+            # F, status = cv2.findFundamentalMat(p0, p1, cv2.FM_RANSAC, 3, .99, status)
+            F, status = cv2.findFundamentalMat(p0, p1, cv2.FM_RANSAC, 3, .99)
+            print(status.mean())
             status = status.ravel() != 0
             if status.sum() < MIN_MATCH_COUNT:
                 continue
@@ -131,19 +134,24 @@ class PlaneTracker:
             e1 = cv2.computeCorrespondEpilines(p0, 1, F)
             e2 = cv2.computeCorrespondEpilines(p1, 2, F)
 
+            p0 = hstack((p0, np.ones((p0.shape[0],1)))).astype(np.float32)
+            K = cv2.initCameraMatrix2D([p0], [p1], common.getsize(frame))
+            print(K)
+            p0 = p0[:,:2]
+            
             w, h = common.getsize(frame)
             retval, H1, H2 = cv2.stereoRectifyUncalibrated(p0, p1, F, (w, h))
 
-            projMat1 = np.hstack((H1, np.zeros((3,1))))
-            projMat2 = np.hstack((H2, np.zeros((3,1))))
+            projMat1 = np.hstack((H1, np.ones((3,1))))
+            projMat2 = np.hstack((H2, np.ones((3,1))))
             points4D = cv2.triangulatePoints(projMat1, projMat2, p0.T, p1.T)
-            print(points4D.shape)
+            print(points4D.T)
             
             x0, y0, x1, y1 = target.rect
             quad = np.float32([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
             quad = cv2.perspectiveTransform(quad.reshape(1, -1, 2), H).reshape(-1, 2)
 
-            track = TrackedTarget(target=target, p0=p0, p1=p1, H=H,
+            track = TrackedTarget(target=target, p0=p0, p1=p1, H=H, K=K, 
                                   F=F, e1=e1, e2=e2, H1=H1, H2=H2, quad=quad)
             tracked.append(track)
         tracked.sort(key = lambda t: len(t.p0), reverse=True)
@@ -163,11 +171,9 @@ class App:
         self.paused = False
         self.tracker = PlaneTracker()
         self.SGBM = 0
-        self.maxDiff = 48
-        if self.SGBM:
-            self.stereoMatcher = cv2.StereoSGBM_create(0, self.maxDiff, 11)
-        else:
-            self.stereoMatcher = cv2.StereoBM_create()
+        self.maxDiff = 32
+        self.blockSize = 21
+        self.stereoMatcher = cv2.StereoBM_create(self.maxDiff, self.blockSize)
 
         # cv2.namedWindow('plane')
         # self.rect_sel = common.RectSelector('plane', self.on_rect)
@@ -178,8 +184,8 @@ class App:
 
     def run(self):
         for imgidx in range(27):
-            # print(os.path.join(thisdir,'../data/castle/castle.%03d.jpg' % (imgidx,))+'\n'+
-            #       os.path.join(thisdir,'../data/castle/castle.%03d.jpg' % (imgidx+1,)))
+            print(os.path.join(thisdir,'../data/castle/castle.%03d.jpg' % (imgidx,))+'\n'+
+                  os.path.join(thisdir,'../data/castle/castle.%03d.jpg' % (imgidx+1,)))
             img1 = cv2.imread(os.path.join(thisdir,'../data/castle/castle.%03d.jpg' % (imgidx,)))
             img2 = cv2.imread(os.path.join(thisdir,'../data/castle/castle.%03d.jpg' % (imgidx+1,)))
             if img1==None or img2==None:
@@ -201,27 +207,27 @@ class App:
                 # cv2.rectangle(vis, (x0+w, y0), (x1+w, y1), (0, 255, 0), 2)
             if len(tracked) > 0:
                 tracked = tracked[0]
-                H, F, e1, e2, H1, H2 = (tracked.H, tracked.F, tracked.e1, tracked.e2, tracked.H1, tracked.H2)
+                H, K, F, e1, e2, H1, H2 = (tracked.H, tracked.K, tracked.F, tracked.e1, tracked.e2, tracked.H1, tracked.H2)
+                dist_coef = np.zeros(4)
 
-                warpSize = (int(w*.8), int(h*.8))
+                # retval, rotations, translations, normals = cv2.decomposeHomographyMat(H, K)
+                # print(H)
+
+                warpSize = (int(w*.9), int(h*.9))
                 img1_warp = cv2.warpPerspective(img1, H1, warpSize)
                 img2_warp = cv2.warpPerspective(img2, H2, warpSize)
+                rectified = cv2.addWeighted(img1_warp, .5, img2_warp, .5, 0)
 
-                if self.SGBM:
-                    disparity = self.stereoMatcher.compute(img1_warp, img2_warp)
-                else:
-                    disparity = self.stereoMatcher.compute(cv2.cvtColor(img1_warp,cv2.COLOR_BGR2GRAY),
-                                                           cv2.cvtColor(img2_warp,cv2.COLOR_BGR2GRAY))
-                disparity, buf = cv2.filterSpeckles(disparity, 0, pow(20,2), self.maxDiff)
+                # disparity = self.stereoMatcher.compute(cv2.cvtColor(img1_warp,cv2.COLOR_BGR2GRAY),
+                #                                        cv2.cvtColor(img2_warp,cv2.COLOR_BGR2GRAY))
+                # disparity, buf = cv2.filterSpeckles(disparity, -self.maxDiff, pow(20,2), self.maxDiff)
                
                 # invH = np.linalg.inv(H)
                 # print('invH = \n',invH)
                 # img2_warp = cv2.warpPerspective(img2,invH,(w,h))
             rectified = cv2.addWeighted(img1_warp,.5,img2_warp,.5,0)
-            cv2.imshow('rectified', rectified)
-            cv2.imshow('disparity', -disparity*40)
-            keyCode = cv2.waitKey()
-            if keyCode==27: exit(0)
+            cv2.imshow('rectified', rectified); [ exit(0) if cv2.waitKey()==27 else None ]
+            # cv2.imshow('disparity', ((disparity+50)*.5).astype(np.uint8)); [ exit(0) if cv2.waitKey()==27 else None ]
 
 
 if __name__ == '__main__':
