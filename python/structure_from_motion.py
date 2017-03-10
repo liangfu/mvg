@@ -23,25 +23,20 @@ from __future__ import print_function
 
 # built-in modules
 from collections import namedtuple
+import sys,os
+thisdir=os.path.dirname(os.path.abspath(__file__))
 
 import numpy as np
 import cv2
-from numpy import vstack, hstack
+np.set_printoptions(suppress=False, formatter={'float_kind':lambda x: "%.5f" % x})
 
 # import matplotlib.pyplot as plt
 # from mpl_toolkits.mplot3d import Axes3D
 
 # local modules
-# import video
-# from video import presets
+import sba
 import common
-from common import getsize, draw_keypoints
-# from plane_tracker import PlaneTracker
-
-import sys,os
-thisdir=os.path.dirname(os.path.abspath(__file__))
-
-np.set_printoptions(suppress=False, formatter={'float_kind':lambda x: "%.5f" % x})
+from common import getsize, draw_keypoints, draw_matches
 
 FLANN_INDEX_KDTREE = 1
 FLANN_INDEX_LSH    = 6
@@ -70,8 +65,43 @@ PlanarTarget = namedtuple('PlaneTarget', 'image, rect, keypoints, descrs, data')
 '''
 TrackedTarget = namedtuple('TrackedTarget', 'target, p0, p1, H, K, F, e1, e2, H1, H2, quad')
 
-class PlaneTracker:
-    def __init__(self):
+
+def sbaDriver(camname,ptsname,intrname=None,camoname=None,ptsoname=None):
+    logging.debug("sbaDriver() {0} {1}".format(camname,ptsname))
+
+    if intrname is None:
+        cameras = sba.Cameras.fromTxt(camname) # Load cameras from file
+    else:
+        # Intrinsic file for all identical cameras not yet implemented
+        logging.warning("Fixed intrinsic parameters not yet implemented")
+        cameras = sba.Cameras.fromTxtWithIntr(camname,intrname)
+    points = sba.Points.fromTxt(ptsname,cameras.ncameras) # Load points
+
+    options = sba.Options.fromInput(cameras,points)
+    #options.camera = sba.OPTS_CAMS_NODIST # only use this if passing in 5+3+3
+    options.nccalib=sba.OPTS_FIX2_INTR # fix all intrinsics
+    # If you wish to fix the intrinsics do so here by setting options
+    options.ncdist = sba.OPTS_FIX5_DIST # fix all distortion coeffs
+
+    newcameras,newpoints,info = sba.SparseBundleAdjust(cameras,points,options)
+    info.printResults()
+
+    if camoname:
+        newcameras.toTxt(camoname)
+    if ptsoname:
+        newpoints.toTxt(ptsoname)
+
+class App:
+    def __init__(self, src):
+        self.cap = None # video.create_capture(src, presets['book'])
+        self.frame = None
+        self.paused = False
+        # self.tracker = PlaneTracker()
+        self.SGBM = 0
+        self.maxDiff = 32
+        self.blockSize = 21
+        self.stereoMatcher = cv2.StereoBM_create(self.maxDiff, self.blockSize)
+
         self.detector = cv2.ORB_create( nfeatures = 4000 )
         self.matcher = cv2.FlannBasedMatcher(flann_params, {})  # bug : need to pass empty dict (#1329)
         self.targets = []
@@ -97,66 +127,6 @@ class PlaneTracker:
         self.targets = []
         self.matcher.clear()
 
-    def track(self, frame):
-        '''Returns a list of detected TrackedTarget objects'''
-        self.frame_points, frame_descrs = self.detect_features(frame)
-        if len(self.frame_points) < MIN_MATCH_COUNT:
-            return []
-        matches = self.matcher.knnMatch(frame_descrs, k = 2)
-        matches = [m[0] for m in matches if len(m) == 2 and m[0].distance < m[1].distance * 0.75]
-        if len(matches) < MIN_MATCH_COUNT:
-            return []
-        matches_by_id = [[] for _ in xrange(len(self.targets))]
-        for m in matches:
-            matches_by_id[m.imgIdx].append(m)
-        tracked = []
-        for imgIdx, matches in enumerate(matches_by_id):
-            if len(matches) < MIN_MATCH_COUNT:
-                continue
-            target = self.targets[imgIdx]
-            p0 = [target.keypoints[m.trainIdx].pt for m in matches]
-            p1 = [self.frame_points[m.queryIdx].pt for m in matches]
-            p0, p1 = np.float32((p0, p1))
-
-            H, status = cv2.findHomography(p0, p1, cv2.RANSAC, 3.0)
-            # status = status.ravel() != 0
-            # if status.sum() < MIN_MATCH_COUNT:
-            #     continue
-            # p0, p1 = p0[status], p1[status]
-
-            # F, status = cv2.findFundamentalMat(p0, p1, cv2.FM_RANSAC, 3, .99, status)
-            F, status = cv2.findFundamentalMat(p0, p1, cv2.FM_RANSAC, 3, .99)
-            print(status.mean())
-            status = status.ravel() != 0
-            if status.sum() < MIN_MATCH_COUNT:
-                continue
-            p0, p1 = p0[status], p1[status]
-            e1 = cv2.computeCorrespondEpilines(p0, 1, F)
-            e2 = cv2.computeCorrespondEpilines(p1, 2, F)
-
-            p0 = hstack((p0, np.ones((p0.shape[0],1)))).astype(np.float32)
-            K = cv2.initCameraMatrix2D([p0], [p1], common.getsize(frame))
-            print(K)
-            p0 = p0[:,:2]
-            
-            w, h = common.getsize(frame)
-            retval, H1, H2 = cv2.stereoRectifyUncalibrated(p0, p1, F, (w, h))
-
-            projMat1 = np.hstack((H1, np.ones((3,1))))
-            projMat2 = np.hstack((H2, np.ones((3,1))))
-            points4D = cv2.triangulatePoints(projMat1, projMat2, p0.T, p1.T)
-            print(points4D.T)
-            
-            x0, y0, x1, y1 = target.rect
-            quad = np.float32([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
-            quad = cv2.perspectiveTransform(quad.reshape(1, -1, 2), H).reshape(-1, 2)
-
-            track = TrackedTarget(target=target, p0=p0, p1=p1, H=H, K=K, 
-                                  F=F, e1=e1, e2=e2, H1=H1, H2=H2, quad=quad)
-            tracked.append(track)
-        tracked.sort(key = lambda t: len(t.p0), reverse=True)
-        return tracked
-
     def detect_features(self, frame):
         '''detect_features(self, frame) -> keypoints, descrs'''
         keypoints, descrs = self.detector.detectAndCompute(frame, None)
@@ -164,70 +134,120 @@ class PlaneTracker:
             descrs = []
         return keypoints, descrs
 
-class App:
-    def __init__(self, src):
-        self.cap = None # video.create_capture(src, presets['book'])
-        self.frame = None
-        self.paused = False
-        self.tracker = PlaneTracker()
-        self.SGBM = 0
-        self.maxDiff = 32
-        self.blockSize = 21
-        self.stereoMatcher = cv2.StereoBM_create(self.maxDiff, self.blockSize)
-
-        # cv2.namedWindow('plane')
-        # self.rect_sel = common.RectSelector('plane', self.on_rect)
-
-    # def on_rect(self, rect):
-    #     self.tracker.clear()
-    #     self.tracker.add_target(self.frame, rect)
+    def track(self, frame):
+        '''Returns a list of detected TrackedTarget objects'''
+        self.frame_points, frame_descrs = self.detect_features(frame)
+        if len(self.frame_points) < MIN_MATCH_COUNT:
+            return []
+        matches = self.matcher.knnMatch(frame_descrs, k = 2)
+        matches = [m[0] for m in matches if len(m) == 2 and m[0].distance < m[1].distance * 0.75]
+        print('%d matches.' % len(matches))
+        if len(matches) < MIN_MATCH_COUNT:
+            return []
+        matches_by_id = [[] for _ in xrange(len(self.targets))]
+        for m in matches:
+            matches_by_id[m.imgIdx].append(m)
+        tracked = []
+        p0, p1 = [], []
+        for imgIdx, matches in enumerate(matches_by_id):
+            if len(matches) < MIN_MATCH_COUNT:
+                continue
+            target = self.targets[imgIdx]
+            p0 = [target.keypoints[m.trainIdx].pt for m in matches]
+            p1 = [self.frame_points[m.queryIdx].pt for m in matches]
+            p0, p1 = np.float32((p0, p1))
+            break
+        return p0, p1
 
     def run(self):
-        for imgidx in range(27):
+        img0 = cv2.imread(os.path.join(thisdir,'../data/castle/castle.000.jpg'))
+        w, h = getsize(img0)
+        
+        for imgidx in range(0,27):
+            # self.tracker = PlaneTracker()
+            print('-------------------------------------------------------')
             print(os.path.join(thisdir,'../data/castle/castle.%03d.jpg' % (imgidx,))+'\n'+
                   os.path.join(thisdir,'../data/castle/castle.%03d.jpg' % (imgidx+1,)))
             img1 = cv2.imread(os.path.join(thisdir,'../data/castle/castle.%03d.jpg' % (imgidx,)))
             img2 = cv2.imread(os.path.join(thisdir,'../data/castle/castle.%03d.jpg' % (imgidx+1,)))
             if img1==None or img2==None:
                 raise Exception('Fail to open images.')
-            w, h = getsize(img1)
-            x0, y0, x1, y1 = (0, 0, w, h)
-            self.tracker.clear()
-            self.tracker.add_target(img1, (x0, y0, x1, y1))
-            tracked = self.tracker.track(img2)
+            self.clear()
+            self.add_target(img1.copy(), (0, 0, w, h))
+            p0, p1 = self.track(img2.copy())
+
+            H, status = cv2.findHomography(p0, p1, cv2.RANSAC, 13.0)
+            status = status.ravel() != 0
+            print('inliner percentage: %.1f %%' % (status.mean().item(0)*100.,))
+            if status.sum() < MIN_MATCH_COUNT:
+                continue
+            p0, p1 = p0[status], p1[status]
+
+            # F, status = cv2.findFundamentalMat(p0, p1, cv2.FM_RANSAC, 3, .99, status)
+            F, status = cv2.findFundamentalMat(p0, p1, cv2.FM_8POINT, 3, .99)
+            # status = status.ravel() != 0
+            # if status.sum() < MIN_MATCH_COUNT:
+            #     continue
+            # p0, p1 = p0[status], p1[status]
+
+            imgpair = cv2.addWeighted(img2, .5, img1, .5, 0)
+            draw_matches(imgpair, p0, p1)
+            cv2.imshow('keypoint matches', imgpair)# ; [ exit(0) if cv2.waitKey()&0xff==27 else None ]
+            
+            # estimate epipolar lines
+            e1 = cv2.computeCorrespondEpilines(p0, 1, F)
+            e2 = cv2.computeCorrespondEpilines(p1, 2, F)
+
+            p0 = np.hstack((p0, np.ones((p0.shape[0],1)))).astype(np.float32)
+            K = cv2.initCameraMatrix2D([p0], [p1], (w, h))
+            # print('K=',K,', with framesize = ', common.getsize(frame))
+            p0 = p0[:,:2]
+            
+            # E, status = cv2.findEssentialMat(p0, p1, 1.0, (0,0))
+            # print('E=',E)
+            E, status = cv2.findEssentialMat(p0, p1, cameraMatrix=K)
+            # print('E=',E)
+            ret, R, t, status = cv2.recoverPose(E, p0, p1, cameraMatrix=K, mask = status)
+            rvec, jacobian = cv2.Rodrigues(R)
+            print('(R, t)=', rvec.T, '\n', t.T)
+            # R1, R2, t = cv2.decomposeEssentialMat(E)
+            # print('(R1, R2, t)=', R1, '\n\n', R2, '\n\n', t.T)
+
+            # w, h = common.getsize(frame)
+            retval, H1, H2 = cv2.stereoRectifyUncalibrated(p0, p1, F, (w, h))
+
+            # print('e1=',e1)
+            projMat1 = np.hstack((H1, np.ones((3,1))))
+            projMat2 = np.hstack((H2, np.ones((3,1))))
+            points4D = cv2.triangulatePoints(projMat1, projMat2, p0.T, p1.T)
+            # print(points4D.T[:,:3])
+            # print(p0)
+
+            objectPoints = points4D.T[:,:3].astype(np.float32)
+            print(objectPoints)
+            retval, rvec, tvec, inliners = cv2.solvePnPRansac(objectPoints, p0.astype(np.float32), K, np.zeros((1,4)))
+            print('rvec, tvec = ', rvec.T, '\n', tvec.T)
 
             rectified = np.zeros((h, w, 3), np.uint8)
             disparity = np.zeros((h, w, 3), np.float32)
-            # vis[:h,:w] = img2
-            if len(self.tracker.targets) > 0:
-                target = self.tracker.targets[0]
-                # vis[:,w:] = target.image
-                # draw_keypoints(vis[:,w:], target.keypoints)
-                x0, y0, x1, y1 = target.rect
-                # cv2.rectangle(vis, (x0+w, y0), (x1+w, y1), (0, 255, 0), 2)
-            if len(tracked) > 0:
-                tracked = tracked[0]
-                H, K, F, e1, e2, H1, H2 = (tracked.H, tracked.K, tracked.F, tracked.e1, tracked.e2, tracked.H1, tracked.H2)
-                dist_coef = np.zeros(4)
 
-                # retval, rotations, translations, normals = cv2.decomposeHomographyMat(H, K)
-                # print(H)
+            # tracked = tracked[0]
+            # H, K, F, e1, e2, H1, H2 = (tracked.H, tracked.K, tracked.F, tracked.e1, tracked.e2, tracked.H1, tracked.H2)
 
-                warpSize = (int(w*.9), int(h*.9))
-                img1_warp = cv2.warpPerspective(img1, H1, warpSize)
-                img2_warp = cv2.warpPerspective(img2, H2, warpSize)
-                rectified = cv2.addWeighted(img1_warp, .5, img2_warp, .5, 0)
+            warpSize = (int(w*.9), int(h*.9))
+            img1_warp = cv2.warpPerspective(img1, H1, warpSize)
+            img2_warp = cv2.warpPerspective(img2, H2, warpSize)
+            rectified = cv2.addWeighted(img1_warp, .5, img2_warp, .5, 0)
 
-                # disparity = self.stereoMatcher.compute(cv2.cvtColor(img1_warp,cv2.COLOR_BGR2GRAY),
-                #                                        cv2.cvtColor(img2_warp,cv2.COLOR_BGR2GRAY))
-                # disparity, buf = cv2.filterSpeckles(disparity, -self.maxDiff, pow(20,2), self.maxDiff)
-               
-                # invH = np.linalg.inv(H)
-                # print('invH = \n',invH)
-                # img2_warp = cv2.warpPerspective(img2,invH,(w,h))
+            disparity = self.stereoMatcher.compute(cv2.cvtColor(img1_warp,cv2.COLOR_BGR2GRAY),
+                                                   cv2.cvtColor(img2_warp,cv2.COLOR_BGR2GRAY))
+            disparity, buf = cv2.filterSpeckles(disparity, -self.maxDiff, pow(20,2), self.maxDiff)
+                
             rectified = cv2.addWeighted(img1_warp,.5,img2_warp,.5,0)
-            cv2.imshow('rectified', rectified); [ exit(0) if cv2.waitKey()==27 else None ]
-            # cv2.imshow('disparity', ((disparity+50)*.5).astype(np.uint8)); [ exit(0) if cv2.waitKey()==27 else None ]
+            cv2.imshow('rectified', rectified)
+            cv2.imshow('disparity', ((disparity+50)*.5).astype(np.uint8))
+
+            [ exit(0) if cv2.waitKey()&0xff==27 else None ]
 
 
 if __name__ == '__main__':
