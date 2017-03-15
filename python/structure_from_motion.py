@@ -34,9 +34,10 @@ np.set_printoptions(suppress=False, formatter={'float_kind':lambda x: "%.5f" % x
 # from mpl_toolkits.mplot3d import Axes3D
 
 # local modules
-import sba
+import visualization
 import common
 from common import getsize, draw_keypoints, draw_matches
+# import sba
 
 FLANN_INDEX_KDTREE = 1
 FLANN_INDEX_LSH    = 6
@@ -91,6 +92,18 @@ def sbaDriver(camname,ptsname,intrname=None,camoname=None,ptsoname=None):
     if ptsoname:
         newpoints.toTxt(ptsoname)
 
+def get_P_prime_from_F(F):
+    W = np.array([[0,-1,0],[1,0,0],[0,0,1]])
+    Z = np.array([[0,-1,0],[1,0,0],[0,0,0]])
+    U, D, V = np.linalg.svd(F)
+    S = np.dot(np.dot(U,Z),U.T)
+    M = np.dot(np.dot(np.dot(U,W.T),np.diag(D)),V)
+    # import pdb; pdb.set_trace()
+    assert(np.allclose(F,np.dot(np.dot(U,np.diag(D)),V)))
+    assert(np.allclose(F,np.dot(S,M)))
+    P_prime = np.hstack((M, U[:,-1].reshape((3,1))))
+    return P_prime
+        
 class App:
     def __init__(self, src):
         self.cap = None # video.create_capture(src, presets['book'])
@@ -144,7 +157,7 @@ class App:
         print('%d matches.' % len(matches))
         if len(matches) < MIN_MATCH_COUNT:
             return []
-        matches_by_id = [[] for _ in xrange(len(self.targets))]
+        matches_by_id = [[] for _ in range(len(self.targets))]
         for m in matches:
             matches_by_id[m.imgIdx].append(m)
         tracked = []
@@ -170,7 +183,7 @@ class App:
                   os.path.join(thisdir,'../data/castle/castle.%03d.jpg' % (imgidx+1,)))
             img1 = cv2.imread(os.path.join(thisdir,'../data/castle/castle.%03d.jpg' % (imgidx,)))
             img2 = cv2.imread(os.path.join(thisdir,'../data/castle/castle.%03d.jpg' % (imgidx+1,)))
-            if img1==None or img2==None:
+            if img1 is None or img2 is None:
                 raise Exception('Fail to open images.')
             self.clear()
             self.add_target(img1.copy(), (0, 0, w, h))
@@ -182,6 +195,9 @@ class App:
             if status.sum() < MIN_MATCH_COUNT:
                 continue
             p0, p1 = p0[status], p1[status]
+
+            if imgidx<2:
+                continue
 
             # F, status = cv2.findFundamentalMat(p0, p1, cv2.FM_RANSAC, 3, .99, status)
             F, status = cv2.findFundamentalMat(p0, p1, cv2.FM_8POINT, 3, .99)
@@ -217,22 +233,28 @@ class App:
             retval, H1, H2 = cv2.stereoRectifyUncalibrated(p0, p1, F, (w, h))
 
             # print('e1=',e1)
-            projMat1 = np.hstack((H1, np.ones((3,1))))
-            projMat2 = np.hstack((H2, np.ones((3,1))))
+            projMat1 = np.hstack((np.eye(3), np.zeros((3,1))))
+            projMat2 = get_P_prime_from_F(F)
             points4D = cv2.triangulatePoints(projMat1, projMat2, p0.T, p1.T)
             # print(points4D.T[:,:3])
             # print(p0)
 
             objectPoints = points4D.T[:,:3].astype(np.float32)
             print(objectPoints)
+            np.savetxt('pts.txt', objectPoints, fmt='%.5f')
+            import matplotlib.pyplot as plt
+            f, axarr = plt.subplots(2, 2)
+            axarr[0,0].plot(p0[:,0], 480-p0[:,1], '.')
+            axarr[0,1].plot(p1[:,0], 480-p1[:,1], '.')
+            axarr[1,0].plot(-objectPoints[:,2], -objectPoints[:,1], '.')
+            axarr[1,1].plot(-objectPoints[:,2], objectPoints[:,0], '.')
+            plt.show()
+
             retval, rvec, tvec, inliners = cv2.solvePnPRansac(objectPoints, p0.astype(np.float32), K, np.zeros((1,4)))
             print('rvec, tvec = ', rvec.T, '\n', tvec.T)
 
             rectified = np.zeros((h, w, 3), np.uint8)
             disparity = np.zeros((h, w, 3), np.float32)
-
-            # tracked = tracked[0]
-            # H, K, F, e1, e2, H1, H2 = (tracked.H, tracked.K, tracked.F, tracked.e1, tracked.e2, tracked.H1, tracked.H2)
 
             warpSize = (int(w*.9), int(h*.9))
             img1_warp = cv2.warpPerspective(img1, H1, warpSize)
@@ -242,8 +264,9 @@ class App:
             disparity = self.stereoMatcher.compute(cv2.cvtColor(img1_warp,cv2.COLOR_BGR2GRAY),
                                                    cv2.cvtColor(img2_warp,cv2.COLOR_BGR2GRAY))
             disparity, buf = cv2.filterSpeckles(disparity, -self.maxDiff, pow(20,2), self.maxDiff)
+            # visualization.visualize(objectPoints)
                 
-            rectified = cv2.addWeighted(img1_warp,.5,img2_warp,.5,0)
+            rectified = cv2.addWeighted(img1_warp, .5, img2_warp, .5, 0)
             cv2.imshow('rectified', rectified)
             cv2.imshow('disparity', ((disparity+50)*.5).astype(np.uint8))
 
